@@ -2,10 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
-TICK_DEFAULT = 0.01
-
-
 @dataclass(frozen=True)
 class ClickMode:
     value: str

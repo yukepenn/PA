@@ -10,6 +10,31 @@ def snap_price(px: float, *, tick: float = 0.01) -> float:
     return round(float(px) / float(tick)) * float(tick)
 
 
+def parse_shape_y_updates(relayout: dict | None) -> dict[int, float]:
+    """
+    Extract Plotly shape y-position updates from relayoutData.
+
+    Expected keys look like: ``shapes[12].y0``.
+    The return value maps shape index -> new y value.
+    """
+    if not relayout:
+        return {}
+
+    shape_updates: dict[int, float] = {}
+    for k, v in relayout.items():
+        if not isinstance(k, str):
+            continue
+        if not k.startswith("shapes[") or not k.endswith("].y0"):
+            continue
+        try:
+            i = int(k.split("[", 1)[1].split("]", 1)[0])
+            y = float(v)
+        except Exception:
+            continue
+        shape_updates[i] = y
+    return shape_updates
+
+
 @dataclass(frozen=True)
 class DraftValidation:
     ok: bool

@@ -7,3 +7,11 @@
 - Style(replay_dash): minimal order-type hints for LIMIT/STOP/MKT short/long grammar
 - Fix(data): auto-detect repo `TradingData` root; env override `PA_TRADINGDATA_BASE`
 
+### [Unreleased] – 2026-04-28
+- Fix(replay_dash): move store JSON decoding into store_io module (StringIO)
+- Fix(replay_dash): make sim overlay marker names use full order_id
+- Test(unit): add trade_viz/viewport/marker identity tests; add pytest conftest for src imports
+- Feat(replay_dash): working-order drag v1 (modify working order prices via sim truth)
+- Chore(repo): remove cache artifacts; add agent handoff doc
+- Refactor(replay_dash): extract pure sim view render helpers and reorganize layout into section builders (no behavior change)
+

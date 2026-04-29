@@ -9,6 +9,18 @@ from plotly.subplots import make_subplots
 from ...replay.engine import ReplayEngine
 from ...replay.models import ReplayState
 
+from .marker_keys import encode_marker_key
+from .marker_names import (
+    DRAFT_ENTRY,
+    DRAFT_ENTRY_LIMIT,
+    DRAFT_ENTRY_STOP,
+    DRAFT_STOP_LOSS,
+    DRAFT_TAKE_PROFIT,
+    SIM_FIELD_ENTRY_LIMIT,
+    SIM_FIELD_ENTRY_STOP,
+    SIM_FIELD_STOP_LOSS,
+    SIM_FIELD_TARGET,
+)
 from .price_labels import PriceMarkerStyle, add_price_marker, suggest_yshift_px
 from .trade_viz import derive_trade_episodes, planned_bracket_levels_at_entry
 from .viewport import rth_session_x_range_utc
@@ -46,7 +58,7 @@ def add_sim_overlays(
 
     used_ys: list[float] = []
 
-    def _marker(y: float, *, color: str, dash: str, label: str, name: str) -> None:
+    def _marker(y: float, *, color: str, dash: str, label: str, name: str, draggable: bool = False) -> None:
         yshift = suggest_yshift_px(used_ys, y=float(y))
         used_ys.append(float(y))
         add_price_marker(
@@ -58,6 +70,9 @@ def add_sim_overlays(
             active=False,
             yshift_px=yshift,
         )
+        if draggable:
+            # Allow v1: working-order drag via Plotly shape editing.
+            fig.layout.shapes[-1].update(editable=True)
 
     # Position/trade context
     pos = sim_store.get("position") or {}
@@ -145,7 +160,8 @@ def add_sim_overlays(
             lp = o.get("limit_price", None)
             sp = o.get("stop_price", None)
             status = str(o.get("status", ""))
-            oid = str(o.get("order_id", ""))[:6]
+            order_id = str(o.get("order_id", "") or "")
+            oid = order_id[:6]
 
             if typ == "LIMIT" and lp is not None:
                 _marker(
@@ -153,7 +169,8 @@ def add_sim_overlays(
                     color="rgba(37,99,235,0.80)",
                     dash="solid",
                     label=f"E LMT {float(lp):.2f} · {status} · {oid}",
-                    name=f"sim:entry_limit:{oid}",
+                    name=encode_marker_key(scope="sim", field=SIM_FIELD_ENTRY_LIMIT, entity_id=order_id),
+                    draggable=True,
                 )
             elif typ == "STOP" and sp is not None:
                 _marker(
@@ -161,7 +178,8 @@ def add_sim_overlays(
                     color="rgba(245,158,11,0.88)",
                     dash="solid",
                     label=f"E STP {float(sp):.2f} · {status} · {oid}",
-                    name=f"sim:entry_stop:{oid}",
+                    name=encode_marker_key(scope="sim", field=SIM_FIELD_ENTRY_STOP, entity_id=order_id),
+                    draggable=True,
                 )
             elif typ == "STOP_LIMIT":
                 if sp is not None:
@@ -170,7 +188,8 @@ def add_sim_overlays(
                         color="rgba(245,158,11,0.88)",
                         dash="dot",
                         label=f"E STP {float(sp):.2f} · {status} · {oid}",
-                        name=f"sim:entry_stop:{oid}",
+                        name=encode_marker_key(scope="sim", field=SIM_FIELD_ENTRY_STOP, entity_id=order_id),
+                        draggable=True,
                     )
                 if lp is not None:
                     _marker(
@@ -178,7 +197,8 @@ def add_sim_overlays(
                         color="rgba(37,99,235,0.80)",
                         dash="dot",
                         label=f"E LMT {float(lp):.2f} · {status} · {oid}",
-                        name=f"sim:entry_limit:{oid}",
+                        name=encode_marker_key(scope="sim", field=SIM_FIELD_ENTRY_LIMIT, entity_id=order_id),
+                        draggable=True,
                     )
 
         # Bracket legs: STOP (stop-loss) and LIMIT (target)
@@ -189,14 +209,16 @@ def add_sim_overlays(
             lp = o.get("limit_price", None)
             sp = o.get("stop_price", None)
             status = str(o.get("status", ""))
-            oid = str(o.get("order_id", ""))[:6]
+            order_id = str(o.get("order_id", "") or "")
+            oid = order_id[:6]
             if typ == "STOP" and sp is not None:
                 _marker(
                     float(sp),
                     color="rgba(234,88,12,0.90)",
                     dash="dash",
                     label=f"Stop {float(sp):.2f} · {status} · {oid}",
-                    name=f"sim:stop_loss:{oid}",
+                    name=encode_marker_key(scope="sim", field=SIM_FIELD_STOP_LOSS, entity_id=order_id),
+                    draggable=True,
                 )
             elif typ == "LIMIT" and lp is not None:
                 _marker(
@@ -204,7 +226,8 @@ def add_sim_overlays(
                     color="rgba(139,92,246,0.86)",
                     dash="dash",
                     label=f"Tgt {float(lp):.2f} · {status} · {oid}",
-                    name=f"sim:target:{oid}",
+                    name=encode_marker_key(scope="sim", field=SIM_FIELD_TARGET, entity_id=order_id),
+                    draggable=True,
                 )
 
     # Closed trades: bounded historical boxes (entry->exit), clipped to visible end.
@@ -384,7 +407,7 @@ def add_draft_overlays(fig: go.Figure, *, draft: dict | None, valid: bool, activ
         _draft_marker(
             float(draft["entry"]),
             label=f"Draft entry {float(draft['entry']):.2f}",
-            name="draft:entry",
+            name=DRAFT_ENTRY,
             color=(C_ENTRY_LIMIT if ok else C_BAD),
             active=(mode == "entry"),
         )
@@ -393,7 +416,7 @@ def add_draft_overlays(fig: go.Figure, *, draft: dict | None, valid: bool, activ
         _draft_marker(
             float(draft["entry_stop"]),
             label=f"Draft entry stop {float(draft['entry_stop']):.2f}",
-            name="draft:entry_stop",
+            name=DRAFT_ENTRY_STOP,
             color=(C_ENTRY_STOP if ok else C_BAD),
             active=(mode == "entry_stop"),
         )
@@ -401,7 +424,7 @@ def add_draft_overlays(fig: go.Figure, *, draft: dict | None, valid: bool, activ
         _draft_marker(
             float(draft["entry_limit"]),
             label=f"Draft entry limit {float(draft['entry_limit']):.2f}",
-            name="draft:entry_limit",
+            name=DRAFT_ENTRY_LIMIT,
             color=(C_ENTRY_LIMIT if ok else C_BAD),
             active=(mode == "entry_limit"),
         )
@@ -409,7 +432,7 @@ def add_draft_overlays(fig: go.Figure, *, draft: dict | None, valid: bool, activ
         _draft_marker(
             float(draft["stop_loss"]),
             label=f"Draft SL {float(draft['stop_loss']):.2f}",
-            name="draft:stop_loss",
+            name=DRAFT_STOP_LOSS,
             color=(C_SL if ok else C_BAD),
             active=(mode == "stop"),
         )
@@ -417,7 +440,7 @@ def add_draft_overlays(fig: go.Figure, *, draft: dict | None, valid: bool, activ
         _draft_marker(
             float(draft["take_profit"]),
             label=f"Draft TP {float(draft['take_profit']):.2f}",
-            name="draft:take_profit",
+            name=DRAFT_TAKE_PROFIT,
             color=(C_TP if ok else C_BAD),
             active=(mode == "target"),
         )

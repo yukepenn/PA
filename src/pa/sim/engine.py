@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from uuid import uuid4
 
@@ -160,6 +161,62 @@ class SimEngine:
         if o.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED):
             return o
         o.status = OrderStatus.CANCELED
+        o.updated_at_utc = _as_utc(ts_utc) if ts_utc is not None else pd.Timestamp.now(tz="UTC")
+        self.state.orders[o.order_id] = o
+        return o
+
+    def modify_order_price(
+        self,
+        order_id: str,
+        *,
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        ts_utc: pd.Timestamp | None = None,
+    ) -> Order:
+        """
+        v1: allow modifying the price fields of an existing unfilled order.
+
+        This is a narrow, sim-truth-driven entrypoint for working-order drag.
+        It does NOT place orders, fill orders, or change activation semantics.
+        """
+        o = self._get(order_id)
+        if o.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED):
+            raise ValueError(f"Order is not modifiable in status={o.status.value}")
+
+        def _v(x: float | None) -> float | None:
+            if x is None:
+                return None
+            xx = float(x)
+            if not math.isfinite(xx):
+                raise ValueError("price must be finite")
+            if xx <= 0:
+                raise ValueError("price must be > 0")
+            return xx
+
+        limit_price = _v(limit_price)
+        stop_price = _v(stop_price)
+
+        # Type/field validation: only permit fields that the order type can legally carry.
+        if o.type == OrderType.MARKET:
+            raise ValueError("MARKET orders have no modifiable price fields")
+        if o.type == OrderType.LIMIT:
+            if limit_price is None:
+                raise ValueError("LIMIT modification requires limit_price")
+            o.limit_price = limit_price
+        elif o.type == OrderType.STOP:
+            if stop_price is None:
+                raise ValueError("STOP modification requires stop_price")
+            o.stop_price = stop_price
+        elif o.type == OrderType.STOP_LIMIT:
+            if limit_price is None and stop_price is None:
+                raise ValueError("STOP_LIMIT modification requires stop_price and/or limit_price")
+            if limit_price is not None:
+                o.limit_price = limit_price
+            if stop_price is not None:
+                o.stop_price = stop_price
+        else:
+            raise ValueError(f"Unsupported order type: {o.type}")
+
         o.updated_at_utc = _as_utc(ts_utc) if ts_utc is not None else pd.Timestamp.now(tz="UTC")
         self.state.orders[o.order_id] = o
         return o

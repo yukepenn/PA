@@ -9,17 +9,40 @@ from dash import ALL, Dash, Input, Output, State, callback_context, html, no_upd
 
 from .ids import IDS
 from .chart import ChartFlags, add_draft_overlays, add_hover_overlay, add_sim_overlays, apply_session_viewport, build_figure, empty_figure
-from .interaction import click_price_from_plotly, snap_price, validate_draft
+from .interaction import click_price_from_plotly, parse_shape_y_updates, snap_price, validate_draft
 from .order_interaction import click_modes_for_order_type, draft_ticket_summary, mode_help_text
 from .order_hints import ticket_context_hints
+from .marker_keys import decode_marker_key
+from .marker_names import (
+    DRAFT_ENTRY,
+    DRAFT_ENTRY_LIMIT,
+    DRAFT_ENTRY_STOP,
+    DRAFT_STOP_LOSS,
+    DRAFT_TAKE_PROFIT,
+    SIM_FIELD_ENTRY_LIMIT,
+    SIM_FIELD_ENTRY_STOP,
+    SIM_FIELD_STOP_LOSS,
+    SIM_FIELD_TARGET,
+)
+from .sim_store_io import _engine_from_store, _new_sim_store, _store_from_engine, _ts
+from .sim_view import (
+    active_working_orders,
+    render_active_orders,
+    render_pnl_summary,
+    render_position_summary,
+    render_recent_fills,
+    render_selected_order_detail,
+    render_session_summary,
+)
+from .store_io import df_from_store_split_json
 from ...data.load_replay_day import ReplayDayRequest, load_replay_day_1min
 from ...data.resample_bars import resample_1min_to_5min
 from ...journal.io import append_decision, delete_decision, read_decisions
 from ...journal.schemas import DecisionRecord
 from ...replay.engine import ReplayEngine
 from ...replay.models import Action, ReplayState
-from ...sim.engine import SimEngine, activation_from_5m_bar_close
-from ...sim.models import BracketSpec, Order, OrderSide, OrderStatus, OrderType, Position, PositionSide, SimSessionMeta
+from ...sim.engine import activation_from_5m_bar_close
+from ...sim.models import BracketSpec, Order, OrderSide, OrderStatus, OrderType, SimSessionMeta
 from ...sim.persistence import SIM_JOURNAL_BASE_DEFAULT, append_equity, append_fills, append_orders, write_metadata, write_position
 
 
@@ -27,6 +50,50 @@ def _clamp_index(i: int, max_i: int) -> int:
     if max_i < 0:
         return -1
     return max(0, min(int(i), int(max_i)))
+
+
+def _clear_draft_state(st: dict) -> dict:
+    """
+    Draft is UI-only state. Clearing it should be consistent across:
+    - successful Place
+    - draft disabled conditions
+    """
+    st2 = dict(st or {})
+    st2["draft"] = {}
+    st2["draft_valid"] = False
+    st2["draft_errors"] = []
+    return st2
+
+
+def _draft_entry_allowed(sim_store: dict | None) -> tuple[bool, str]:
+    """
+    Whether the user is allowed to construct a new draft ticket.
+    Keep this aligned with the existing UI policy (disable while position is open).
+    """
+    try:
+        pos = (sim_store or {}).get("position") or {}
+        if int(pos.get("qty", 0) or 0) != 0:
+            return False, "Position is open: close/flatten before starting a new draft ticket."
+    except Exception:
+        pass
+    return True, ""
+
+
+def _draft_overlays_allowed(sim_store: dict | None) -> bool:
+    """
+    Whether draft overlays should be rendered on the chart.
+    Keep this aligned with existing render_chart behavior.
+    """
+    try:
+        pos = (sim_store or {}).get("position") or {}
+        if int(pos.get("qty", 0) or 0) != 0:
+            return False
+        active_status = {"PENDING", "WORKING", "TRIGGERED"}
+        if any(str(o.get("status", "")) in active_status for o in (sim_store or {}).get("orders", []) or []):
+            return False
+    except Exception:
+        return True
+    return True
 
 
 def _parse_plotly_axis_ranges(relayout: dict) -> tuple[object | None, object | None, object | None, object | None]:
@@ -140,128 +207,6 @@ def _try_persist(fn, *args, **kwargs) -> tuple[bool, str]:
         return False, f"OS error: {e}"
     except Exception as e:  # noqa: BLE001
         return False, f"Persist failed: {e}"
-
-
-def _ts(ts: pd.Timestamp | None) -> str | None:
-    if ts is None:
-        return None
-    t = pd.Timestamp(ts)
-    t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
-    return t.isoformat()
-
-
-def _ts_from(s: str | None) -> pd.Timestamp | None:
-    if not s:
-        return None
-    return pd.Timestamp(s).tz_convert("UTC")
-
-
-def _order_to_dict(o: Order) -> dict:
-    return {
-        "order_id": o.order_id,
-        "symbol": o.symbol,
-        "side": str(o.side.value),
-        "type": str(o.type.value),
-        "qty": int(o.qty),
-        "limit_price": o.limit_price,
-        "stop_price": o.stop_price,
-        "placed_at_utc": _ts(o.placed_at_utc),
-        "active_from_utc": _ts(o.active_from_utc),
-        "status": str(o.status.value),
-        "parent_order_id": o.parent_order_id,
-        "oco_group_id": o.oco_group_id,
-        "created_at_utc": _ts(o.created_at_utc),
-        "updated_at_utc": _ts(o.updated_at_utc),
-    }
-
-
-def _order_from_dict(d: dict) -> Order:
-    o = Order(
-        order_id=str(d["order_id"]),
-        symbol=str(d["symbol"]),
-        side=OrderSide(str(d["side"])),
-        type=OrderType(str(d["type"])),
-        qty=int(d["qty"]),
-        limit_price=d.get("limit_price", None),
-        stop_price=d.get("stop_price", None),
-        placed_at_utc=_ts_from(d.get("placed_at_utc")),
-        active_from_utc=_ts_from(d.get("active_from_utc")),
-        status=OrderStatus(str(d.get("status", OrderStatus.PENDING.value))),
-        parent_order_id=d.get("parent_order_id", None),
-        oco_group_id=d.get("oco_group_id", None),
-    )
-    # best-effort timestamps
-    if d.get("created_at_utc"):
-        o.created_at_utc = _ts_from(d.get("created_at_utc")) or o.created_at_utc
-    if d.get("updated_at_utc"):
-        o.updated_at_utc = _ts_from(d.get("updated_at_utc")) or o.updated_at_utc
-    return o
-
-
-def _pos_to_dict(p: Position) -> dict:
-    return {
-        "symbol": p.symbol,
-        "side": str(p.side.value),
-        "qty": int(p.qty),
-        "avg_entry": p.avg_entry,
-        "realized_pnl": float(p.realized_pnl),
-    }
-
-
-def _pos_from_dict(d: dict, symbol: str) -> Position:
-    return Position(
-        symbol=symbol,
-        side=PositionSide(str(d.get("side", PositionSide.FLAT.value))),
-        qty=int(d.get("qty", 0)),
-        avg_entry=d.get("avg_entry", None),
-        realized_pnl=float(d.get("realized_pnl", 0.0)),
-    )
-
-
-def _new_sim_store(symbol: str, date_et: str) -> dict:
-    meta = SimSessionMeta.new(symbol, date_et)
-    return {
-        "session_id": meta.session_id,
-        "symbol": meta.symbol,
-        "date_et": meta.date_et,
-        "starting_equity": 0.0,
-        "last_processed_utc": None,
-        "last_equity": None,
-        "persist_ok": True,
-        "persist_err": "",
-        "position": _pos_to_dict(Position(symbol=meta.symbol)),
-        "orders": [],
-        "fills": [],
-    }
-
-
-def _engine_from_store(sim_store: dict) -> SimEngine:
-    meta = SimSessionMeta(session_id=str(sim_store["session_id"]), symbol=str(sim_store["symbol"]), date_et=str(sim_store["date_et"]))
-    eng = SimEngine(meta, starting_equity=float(sim_store.get("starting_equity", 0.0)))
-    eng.state.last_processed_utc = _ts_from(sim_store.get("last_processed_utc"))
-    eng.state.position = _pos_from_dict(sim_store.get("position", {}), meta.symbol)
-    orders = {}
-    for od in sim_store.get("orders", []) or []:
-        o = _order_from_dict(od)
-        orders[o.order_id] = o
-    eng.state.orders = orders
-    return eng
-
-
-def _store_from_engine(eng: SimEngine) -> dict:
-    return {
-        "session_id": eng.state.meta.session_id,
-        "symbol": eng.state.meta.symbol,
-        "date_et": eng.state.meta.date_et,
-        "starting_equity": float(eng.starting_equity),
-        "last_processed_utc": _ts(eng.state.last_processed_utc),
-        "last_equity": None,
-        "persist_ok": True,
-        "persist_err": "",
-        "position": _pos_to_dict(eng.state.position),
-        "orders": [_order_to_dict(o) for o in eng.state.orders.values()],
-        "fills": [],
-    }
 
 
 def register(app: Dash) -> None:
@@ -519,20 +464,7 @@ def register(app: Dash) -> None:
         if not relayout or not fig_json:
             return no_update, no_update, no_update, no_update
 
-        # Look for shape y updates like: shapes[12].y0 / shapes[12].y1
-        shape_updates: dict[int, float] = {}
-        for k, v in (relayout or {}).items():
-            if not isinstance(k, str):
-                continue
-            if not k.startswith("shapes[") or not k.endswith("].y0"):
-                continue
-            try:
-                i = int(k.split("[", 1)[1].split("]", 1)[0])
-                y = float(v)
-            except Exception:
-                continue
-            shape_updates[i] = y
-
+        shape_updates = parse_shape_y_updates(relayout)
         if not shape_updates:
             return no_update, no_update, no_update, no_update
 
@@ -554,24 +486,87 @@ def register(app: Dash) -> None:
             y2 = _snap(y)
 
             # Map by explicit shape name (prevents STOP_LIMIT collisions).
-            if name == "draft:entry":
+            if name == DRAFT_ENTRY:
                 if ot == "LIMIT":
                     out_limit = y2
                 elif ot == "STOP":
                     out_stop = y2
                 # MARKET has no entry; STOP_LIMIT uses explicit legs.
-            elif name == "draft:entry_limit":
+            elif name == DRAFT_ENTRY_LIMIT:
                 if ot == "STOP_LIMIT":
                     out_limit = y2
-            elif name == "draft:entry_stop":
+            elif name == DRAFT_ENTRY_STOP:
                 if ot == "STOP_LIMIT":
                     out_stop = y2
-            elif name == "draft:stop_loss":
+            elif name == DRAFT_STOP_LOSS:
                 out_sl = y2
-            elif name == "draft:take_profit":
+            elif name == DRAFT_TAKE_PROFIT:
                 out_tp = y2
 
         return out_limit, out_stop, out_sl, out_tp
+
+    @app.callback(
+        Output(IDS.SIM_STORE, "data", allow_duplicate=True),
+        Output(IDS.SIM_STATUS, "children", allow_duplicate=True),
+        Input(IDS.CHART, "relayoutData"),
+        State(IDS.CHART, "figure"),
+        State(IDS.SIM_STORE, "data"),
+        prevent_initial_call=True,
+    )
+    def on_working_order_drag(relayout, fig_json, sim_store):
+        """
+        v1 working-order drag:
+        - user drags an existing working order line (rendered by add_sim_overlays)
+        - Plotly emits shapes[i].y0 in relayoutData
+        - commit modification through SimEngine.modify_order_price (SIM_STORE truth)
+        """
+        if not relayout or not fig_json or not sim_store:
+            return no_update, no_update
+
+        shape_updates = parse_shape_y_updates(relayout)
+        if not shape_updates:
+            return no_update, no_update
+
+        shapes = ((fig_json.get("layout") or {}).get("shapes")) or []
+        if not isinstance(shapes, list) or not shapes:
+            return no_update, no_update
+
+        # Choose the last updated shape deterministically.
+        i_last = sorted(shape_updates.keys())[-1]
+        if i_last < 0 or i_last >= len(shapes):
+            return no_update, no_update
+        sh = shapes[i_last] or {}
+        name = str(sh.get("name", "") or "")
+        mk = decode_marker_key(name)
+        if not mk or mk.scope != "sim":
+            # Not a working-order line (ignore draft/trade/etc.)
+            return no_update, no_update
+
+        order_id = str(mk.entity_id)
+        field = str(mk.field)
+        if field not in (SIM_FIELD_ENTRY_LIMIT, SIM_FIELD_ENTRY_STOP, SIM_FIELD_STOP_LOSS, SIM_FIELD_TARGET):
+            return no_update, no_update
+
+        px = snap_price(float(shape_updates[i_last]), tick=0.01)
+
+        eng = _engine_from_store(sim_store)
+        try:
+            # Map semantic field -> order price field (narrow v1).
+            if field in (SIM_FIELD_ENTRY_LIMIT, SIM_FIELD_TARGET):
+                o = eng.modify_order_price(order_id, limit_price=px)
+            else:
+                o = eng.modify_order_price(order_id, stop_price=px)
+
+            ok, err = _try_persist(append_orders, [o], SIM_JOURNAL_BASE_DEFAULT, eng.state.meta.session_id)
+            s2 = _store_from_engine(eng)
+            s2["persist_ok"] = bool(sim_store.get("persist_ok", True) and ok)
+            s2["persist_err"] = str(err or sim_store.get("persist_err", "") or "")
+            msg = f"Modified {field} to {px:.2f}."
+            if not ok:
+                msg = msg + f" (persistence disabled: {err})"
+            return s2, _render_status(msg, ok=True if ok else False)
+        except Exception as e:  # noqa: BLE001
+            return no_update, _render_status(f"Modify rejected: {e}", ok=False)
 
     @app.callback(
         Output(IDS.INTERACT_STORE, "data", allow_duplicate=True),
@@ -595,32 +590,27 @@ def register(app: Dash) -> None:
         if not loaded:
             return st, "", True, ""
 
-        # Policy: one-at-a-time. While a position is open, disable draft construction overlays.
-        try:
-            pos = (sim_store or {}).get("position") or {}
-            if int(pos.get("qty", 0) or 0) != 0:
-                st["draft"] = {}
-                st["draft_valid"] = False
-                st["draft_errors"] = ["Position is open: close/flatten before starting a new draft ticket."]
-                msg = html.Div(
-                    [
-                        html.Div("Draft disabled:", style={"fontWeight": 700, "color": "#dc2626"}),
-                        html.Div("• Position is open. Flatten/close before placing a new ticket.", style={"fontSize": "12px"}),
-                    ]
-                )
-                summ = draft_ticket_summary(
-                    side=str(side),
-                    order_type=str(otype),
-                    qty=int(qty) if qty is not None and str(qty) != "" else None,
-                    limit_px=None,
-                    stop_px=None,
-                    stop_loss=None,
-                    take_profit=None,
-                    mark_price=None,
-                )
-                return st, msg, True, summ
-        except Exception:
-            pass
+        ok_draft, reason = _draft_entry_allowed(sim_store)
+        if not ok_draft:
+            st = _clear_draft_state(st)
+            st["draft_errors"] = [reason]
+            msg = html.Div(
+                [
+                    html.Div("Draft disabled:", style={"fontWeight": 700, "color": "#dc2626"}),
+                    html.Div("• Position is open. Flatten/close before placing a new ticket.", style={"fontSize": "12px"}),
+                ]
+            )
+            summ = draft_ticket_summary(
+                side=str(side),
+                order_type=str(otype),
+                qty=int(qty) if qty is not None and str(qty) != "" else None,
+                limit_px=None,
+                stop_px=None,
+                stop_loss=None,
+                take_profit=None,
+                mark_price=None,
+            )
+            return st, msg, True, summ
         # snap draft prices
         def _sn(v):
             if v is None or str(v) == "":
@@ -907,7 +897,7 @@ def register(app: Dash) -> None:
         if not bars5_data or not bars1_data or not meta or not sim_store:
             return no_update, no_update
 
-        df5 = pd.read_json(bars5_data, orient="split")
+        df5 = df_from_store_split_json(bars5_data)
         if df5.empty:
             return no_update, no_update
         idx = _clamp_index(int(idx or 0), len(df5) - 1)
@@ -926,7 +916,7 @@ def register(app: Dash) -> None:
                 )
                 return no_update, _render_status(warn, ok=False)
 
-        df1 = pd.read_json(bars1_data, orient="split")
+        df1 = df_from_store_split_json(bars1_data)
         if df1.empty:
             return no_update, no_update
         df1["ts_utc"] = pd.to_datetime(df1["ts_utc"], utc=True, errors="raise")
@@ -1028,7 +1018,7 @@ def register(app: Dash) -> None:
     def sim_place(n, side, otype, qty, limit_px, stop_px, sl, tp, bars5_data, meta, idx, sim_store, interact_store):
         if not bars5_data or not meta or not sim_store:
             return no_update, _render_status("Load a day first.", ok=False), no_update, no_update, no_update, no_update, no_update
-        df5 = pd.read_json(bars5_data, orient="split")
+        df5 = df_from_store_split_json(bars5_data)
         if df5.empty:
             return no_update, _render_status("No bars loaded.", ok=False), no_update, no_update, no_update, no_update, no_update
         idx = _clamp_index(int(idx or 0), len(df5) - 1)
@@ -1049,7 +1039,7 @@ def register(app: Dash) -> None:
             created: list[Order] = []
             if sl_v is not None or tp_v is not None:
                 legs = eng.place_bracket_order(
-                    entry_side=side_e if side_e in (OrderSide.BUY, OrderSide.SELL_SHORT) else side_e,
+                    entry_side=side_e,
                     entry_type=type_e,
                     qty=q,
                     placed_at_utc=seen_close,
@@ -1079,11 +1069,7 @@ def register(app: Dash) -> None:
             if not ok:
                 msg = msg + f" (persistence disabled: {err})"
             # Policy: successful place clears the draft ticket (clean lifecycle).
-            st2 = dict(interact_store or {})
-            st2.pop("draft", None)
-            st2["draft"] = {}
-            st2["draft_valid"] = False
-            st2["draft_errors"] = []
+            st2 = _clear_draft_state(dict(interact_store or {}))
             return sim_store2, _render_status(msg, ok=True if ok else False), st2, None, None, None, None
         except Exception as e:  # noqa: BLE001
             return no_update, _render_status(f"Place failed: {e}", ok=False), no_update, no_update, no_update, no_update, no_update
@@ -1125,7 +1111,7 @@ def register(app: Dash) -> None:
     def sim_flatten(n, bars5_data, idx, sim_store):
         if not sim_store or not bars5_data:
             return no_update, no_update
-        df5 = pd.read_json(bars5_data, orient="split")
+        df5 = df_from_store_split_json(bars5_data)
         if df5.empty:
             return no_update, _render_status("No bars loaded.", ok=False)
         idx = _clamp_index(int(idx or 0), len(df5) - 1)
@@ -1164,132 +1150,12 @@ def register(app: Dash) -> None:
             return "No sim session.", "", "", "", "", []
         eng = _engine_from_store(sim_store)
         pos = eng.state.position
-        avg_s = f"{pos.avg_entry:.2f}" if pos.avg_entry is not None else "—"
-        pos_line = html.Div(
-            [
-                html.Span(f"{pos.side.value}", style={"fontWeight": 800}),
-                html.Span(f"  qty {pos.qty}", style={"marginLeft": "8px"}),
-                html.Span(f"  avg {avg_s}", style={"marginLeft": "8px"}),
-            ],
-            style={"fontSize": "13px"},
-        )
-
-        # PnL from last equity snapshot if available (advanced as replay progresses)
-        le = sim_store.get("last_equity")
-        if le:
-            pnl_line = html.Div(
-                [
-                    html.Span("U ", style={"color": "#64748b"}),
-                    html.Span(f"{float(le.get('unrealized_pnl', 0.0)):.2f}", style={"fontWeight": 800}),
-                    html.Span("   R ", style={"color": "#64748b", "marginLeft": "10px"}),
-                    html.Span(f"{float(le.get('realized_pnl', 0.0)):.2f}", style={"fontWeight": 800}),
-                    html.Span("   Eq ", style={"color": "#64748b", "marginLeft": "10px"}),
-                    html.Span(f"{float(le.get('equity', 0.0)):.2f}", style={"fontWeight": 800}),
-                    html.Span(f"   mark {float(le.get('last_price', 0.0)):.2f}", style={"color": "#64748b", "marginLeft": "10px"}),
-                ],
-                style={"fontSize": "13px"},
-            )
-        else:
-            pnl_line = html.Div(
-                [
-                    html.Span("U ", style={"color": "#64748b"}),
-                    html.Span("0.00", style={"fontWeight": 800}),
-                    html.Span("   R ", style={"color": "#64748b", "marginLeft": "10px"}),
-                    html.Span(f"{pos.realized_pnl:.2f}", style={"fontWeight": 800}),
-                    html.Span("   Eq ", style={"color": "#64748b", "marginLeft": "10px"}),
-                    html.Span(f"{(eng.starting_equity + pos.realized_pnl):.2f}", style={"fontWeight": 800}),
-                ],
-                style={"fontSize": "13px"},
-            )
-
-        persist_ok = bool(sim_store.get("persist_ok", True))
-        persist_err = str(sim_store.get("persist_err", "") or "")
-
-        sess = html.Div(
-            [
-                html.Span(f"Session {str(sim_store.get('session_id',''))[:8]}", style={"fontWeight": 700}),
-                html.Span(f" · fills {len(sim_store.get('fills', []) or [])}", style={"marginLeft": "8px", "color": "#64748b"}),
-                html.Span(f" · active orders {len([o for o in (sim_store.get('orders', []) or []) if str(o.get('status','')) in ('PENDING','WORKING','TRIGGERED')])}", style={"marginLeft": "8px", "color": "#64748b"}),
-                html.Span(" · persisted" if persist_ok else " · persistence disabled", style={"marginLeft": "8px", "color": "#16a34a" if persist_ok else "#dc2626"}),
-                html.Span(f" ({persist_err})" if (not persist_ok and persist_err) else "", style={"color": "#dc2626"}),
-            ],
-            style={"fontSize": "12px"},
-        )
-
-        active = [o for o in eng.state.orders.values() if o.status in (OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.TRIGGERED)]
-        active.sort(key=lambda o: str(o.created_at_utc))
-        if not active:
-            active_div = html.Div("No active orders.", style={"fontSize": "12px", "color": "#475569"})
-            cancel_opts = []
-        else:
-            cancel_opts = [{"label": f"{o.order_id[:8]} · {o.side.value} {o.type.value} x{o.qty} · {o.status.value}", "value": o.order_id} for o in active]
-            header = html.Tr(
-                [
-                    html.Th("id", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("side", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("type", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("qty", style={"textAlign": "right", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("status", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("active", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("px", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                ]
-            )
-            body = []
-            for o in active[:15]:
-                af = pd.Timestamp(o.active_from_utc).strftime("%H:%M") + " UTC" if o.active_from_utc is not None else "now"
-                px = []
-                if o.limit_price is not None:
-                    px.append(f"L {float(o.limit_price):.2f}")
-                if o.stop_price is not None:
-                    px.append(f"S {float(o.stop_price):.2f}")
-                px_s = ", ".join(px) if px else "—"
-                body.append(
-                    html.Tr(
-                        [
-                            html.Td(o.order_id[:8], style={"fontSize": "12px", "fontFamily": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"}),
-                            html.Td(o.side.value, style={"fontSize": "12px"}),
-                            html.Td(o.type.value, style={"fontSize": "12px"}),
-                            html.Td(str(int(o.qty)), style={"fontSize": "12px", "textAlign": "right"}),
-                            html.Td(o.status.value, style={"fontSize": "12px", "fontWeight": 700 if o.status.value in ("WORKING", "TRIGGERED") else 500}),
-                            html.Td(af, style={"fontSize": "12px"}),
-                            html.Td(px_s, style={"fontSize": "12px"}),
-                        ]
-                    )
-                )
-            active_div = html.Table(
-                [html.Thead(header), html.Tbody(body)],
-                style={"width": "100%", "borderCollapse": "collapse"},
-            )
-
-        fills = list(sim_store.get("fills", []) or [])[-10:]
-        if not fills:
-            fills_div = html.Div("No fills yet.", style={"fontSize": "12px", "color": "#475569"})
-        else:
-            header = html.Tr(
-                [
-                    html.Th("time", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("side", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("qty", style={"textAlign": "right", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("price", style={"textAlign": "right", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                    html.Th("order", style={"textAlign": "left", "fontSize": "11px", "color": "#64748b", "fontWeight": 700}),
-                ]
-            )
-            body = []
-            for f in reversed(fills):
-                ts = pd.Timestamp(f["ts_utc"]).tz_convert("UTC").strftime("%H:%M") + " UTC" if f.get("ts_utc") else "n/a"
-                body.append(
-                    html.Tr(
-                        [
-                            html.Td(ts, style={"fontSize": "12px"}),
-                            html.Td(str(f.get("side", "")), style={"fontSize": "12px"}),
-                            html.Td(str(int(f.get("qty", 0))), style={"fontSize": "12px", "textAlign": "right"}),
-                            html.Td(f"{float(f.get('price', 0.0)):.2f}", style={"fontSize": "12px", "textAlign": "right", "fontFamily": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"}),
-                            html.Td(str(f.get("order_id", ""))[:8], style={"fontSize": "12px", "fontFamily": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"}),
-                        ]
-                    )
-                )
-            fills_div = html.Table([html.Thead(header), html.Tbody(body)], style={"width": "100%", "borderCollapse": "collapse"})
-
+        pos_line = render_position_summary(pos)
+        pnl_line = render_pnl_summary(sim_store, pos, starting_equity=eng.starting_equity)
+        sess = render_session_summary(sim_store)
+        active = active_working_orders(list(eng.state.orders.values()))
+        active_div, cancel_opts = render_active_orders(active)
+        fills_div = render_recent_fills(sim_store)
         return pos_line, pnl_line, sess, active_div, fills_div, cancel_opts
 
     @app.callback(
@@ -1307,22 +1173,7 @@ def register(app: Dash) -> None:
         can_flatten = eng.state.position.qty != 0
         cancel_disabled = not bool(selected_order_id)
         flatten_disabled = not bool(can_flatten)
-
-        # Selected order details (for confidence / ergonomics)
-        detail = ""
-        if selected_order_id:
-            od = next((o for o in (sim_store.get("orders", []) or []) if o.get("order_id") == selected_order_id), None)
-            if od:
-                px = []
-                if od.get("limit_price") is not None:
-                    px.append(f"L {float(od.get('limit_price')):.2f}")
-                if od.get("stop_price") is not None:
-                    px.append(f"S {float(od.get('stop_price')):.2f}")
-                af = od.get("active_from_utc")
-                af_s = pd.Timestamp(af).tz_convert("UTC").strftime("%H:%M") + " UTC" if af else "now"
-                detail = f"Selected: {str(od.get('side',''))} {str(od.get('type',''))} x{int(od.get('qty',0))} · {str(od.get('status',''))} · active {af_s}" + (
-                    f" · {', '.join(px)}" if px else ""
-                )
+        detail = render_selected_order_detail(sim_store, selected_order_id)
         return cancel_disabled, flatten_disabled, detail
 
     @app.callback(
@@ -1428,7 +1279,7 @@ def register(app: Dash) -> None:
     def render_replay_info(bars_data, meta, idx):
         if not bars_data or not meta:
             return "No day loaded."
-        df = pd.read_json(bars_data, orient="split")
+        df = df_from_store_split_json(bars_data)
         if df.empty:
             return "No bars loaded."
         idx = int(idx) if idx is not None else 0
@@ -1458,7 +1309,7 @@ def register(app: Dash) -> None:
     def render_chart(bars_data, meta, idx, show_volume, view_rev, show_or, sim_store, interact_store, viewport):
         if not bars_data or not meta:
             return empty_figure()
-        df = pd.read_json(bars_data, orient="split")
+        df = df_from_store_split_json(bars_data)
         idx = int(idx) if idx is not None else 0
         idx = _clamp_index(idx, len(df) - 1)
         flags = ChartFlags(show_volume=bool(show_volume), show_or=bool(show_or))
@@ -1468,17 +1319,7 @@ def register(app: Dash) -> None:
 
         # Clean overlay lifecycle grammar:
         # - draft overlays only when there is no open position and no active working orders
-        has_open_pos = False
-        has_active_orders = False
-        try:
-            pos = (sim_store or {}).get("position") or {}
-            has_open_pos = int(pos.get("qty", 0) or 0) != 0
-            active_status = {"PENDING", "WORKING", "TRIGGERED"}
-            has_active_orders = any(str(o.get("status", "")) in active_status for o in (sim_store or {}).get("orders", []) or [])
-        except Exception:
-            pass
-
-        if not has_open_pos and not has_active_orders:
+        if _draft_overlays_allowed(sim_store):
             # Draft preview overlays (UI-only; not actual sim orders).
             draft = st.get("draft") or {}
             valid = bool(st.get("draft_valid", True))
@@ -1563,7 +1404,7 @@ def register(app: Dash) -> None:
     def save_decision(n_clicks, bars_data, meta, idx, action, setup, phase, conf, quality, entry, stop, target, pass_reason, notes):
         if not bars_data or not meta:
             return _render_status("Load a day first.", ok=False), no_update
-        df = pd.read_json(bars_data, orient="split")
+        df = df_from_store_split_json(bars_data)
         if df.empty:
             return _render_status("No bars loaded.", ok=False), no_update
         idx = _clamp_index(int(idx or 0), len(df) - 1)
